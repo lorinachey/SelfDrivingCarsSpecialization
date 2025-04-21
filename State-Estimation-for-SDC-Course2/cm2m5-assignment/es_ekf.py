@@ -136,12 +136,28 @@ lidar_i = 0
 ################################################################################################
 def measurement_update(sensor_var, p_cov_check, y_k, p_check, v_check, q_check):
     # 3.1 Compute Kalman Gain
+    H = h_jac
+    S = H @ p_cov_check @ H.T + sensor_var
+    K = p_cov_check @ H.T @ np.linalg.inv(S)
 
-    # 3.2 Compute error state
+    # 3.2 Compute error state (Kalman gain * the actual - predicted)
+    # This is Shape=(9,) 3 vars for position (dx, dy, dz), 3 vars for velocity (dvx, dvy, dvz)
+    #     and 3 vars for the quaternion (dtheta_x, dtheta_y, dtheta_z)
+    delta_x_hat_k = K @ (y_k - p_check)
 
     # 3.3 Correct predicted state
+    # Update position and velocity
+    p_hat = p_check + delta_x_hat_k[0:3]
+    v_hat = v_check + delta_x_hat_k[3:6]
 
+    # Orientation update using small-angle approximation
+    delta_theta = delta_x_hat_k[6:9] # Pull out the small angle rotation vector from the error state
+    delta_q = Quaternion(axis_angle=delta_theta).to_numpy()  # convert rotation vector to quaternion
+    q_hat = Quaternion(q=delta_q) * Quaternion(q=q_check)  # left-multiplied small rotation because we're applying the rotation in the local body frame
+    q_hat = q_hat.normalized().to_numpy()
+    
     # 3.4 Compute corrected covariance
+    p_cov_hat = (np.eye(3) - K @ H) @ p_cov_check
 
     return p_hat, v_hat, q_hat, p_cov_hat
 
@@ -154,15 +170,64 @@ def measurement_update(sensor_var, p_cov_check, y_k, p_check, v_check, q_check):
 for k in range(1, imu_f.data.shape[0]):  # start at 1 b/c we have initial prediction from gt
     delta_t = imu_f.t[k] - imu_f.t[k - 1]
 
-    # 1. Update state with IMU inputs
+    # 1. Update state with IMU inputs (Think of this as “If I trust only my IMU, where would I be after this timestep?”)
+
+    # Set up previous state vars
+    p_prev = p_est[k - 1]
+    v_prev = v_est[k - 1]
+    q_prev = Quaternion(q=q_est[k - 1])  # assumes [x, y, z, w] order
+
+    # Update the orientation with the gyro
+    omega = imu_w.data[k-1]
+    delta_theta = omega * delta_t
+    delta_q = Quaternion(axis_angle=delta_theta)
+    q_check = (q_prev * delta_q).normalized()
+
+    # Now update the state with accelerometer data
+    C_body_to_world = q_check.to_mat()
+    accelerometer_wf = (C_body_to_world @ imu_f.data[k-1].reshape(3, 1)).flatten()
+    accel_wf_corrected = accelerometer_wf + g
+
+    v_check = v_prev + accel_wf_corrected * delta_t
+    p_check = p_prev + v_prev * delta_t + 0.5 * accel_wf_corrected * delta_t**2
+    
 
     # 1.1 Linearize the motion model and compute Jacobians
 
-    # 2. Propagate uncertainty
+    """
+    "A small error in orientation changes how acceleration is rotated into the world frame,
+    which changes the velocity estimate — and this is the linearized way to model that."
+    """
+    a_skew = skew_symmetric(accel_wf_corrected)
+    F = np.eye(9)
+    F[0:3, 3:6] = np.eye(3) * delta_t
+    F[3:6, 6:9] = -C_body_to_world @ a_skew * delta_t
+    Q = np.diag([var_imu_f]*3 + [var_imu_w]*3)
 
-    # 3. Check availability of GNSS and LIDAR measurements
+    # 2. Propagate uncertainty (use the motion model Jacobians to update the error-state covariance matrix)
+    p_cov_check = F @ p_cov[k - 1] @ F.T + l_jac @ Q @ l_jac.T
+
+    # 3. Check availability of GNSS and LIDAR measurements - ONLY run measurements when timesteps match
+    # Check for GNSS update
+    if gnss_i < gnss.data.shape[0] and imu_f.t[k] == gnss.t[gnss_i]:
+        y_k = gnss.data[gnss_i]
+        p_check, v_check, q_check, p_cov_check = measurement_update(
+            var_gnss, p_cov_check, y_k, p_check, v_check, q_check)
+        gnss_i += 1
+
+    # Check for LIDAR update
+    if lidar_i < lidar.data.shape[0] and imu_f.t[k] == lidar.t[lidar_i]:
+        y_k = lidar.data[lidar_i]
+        p_check, v_check, q_check, p_cov_check = measurement_update(
+            var_lidar, p_cov_check, y_k, p_check, v_check, q_check)
+        lidar_i += 1
 
     # Update states (save)
+    p_est[k] = p_check
+    v_est[k] = v_check
+    q_est[k] = q_check.to_numpy()  # store quaternion as array
+    p_cov[k] = p_cov_check
+
 
 #### 6. Results and Analysis ###################################################################
 
